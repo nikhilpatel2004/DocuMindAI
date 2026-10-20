@@ -92,7 +92,16 @@ export async function apiFetch(path, options = {}) {
     throw new ApiError(await readDetail(res), res.status);
   }
   if (res.status === 204) return null;
-  return res.json().catch(() => ({}));
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    // A static host serving index.html here means the request never reached
+    // the backend (usually a missing/incorrect VITE_API_URL).
+    throw new ApiError(
+      "The API returned a non-JSON response. Check that VITE_API_URL points to the backend.",
+      res.status
+    );
+  }
+  return res.json();
 }
 
 /**
