@@ -1,0 +1,22 @@
+# Runtime pins matching the verified Python 3.14 environment (no upgrades).
+# PyTorch is installed separately as the CPU-only wheel in the Dockerfile.
+fastapi==0.143.2
+uvicorn==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.0
+python-dotenv==1.2.4
+PyJWT==2.15.1
+bcrypt==5.0.0
+pypdf==6.20.1
+qdrant-client==1.19.1
+sentence-transformers==6.1.0
+python-multipart==0.0.32
+httpx==0.28.1
+transformers==5.20.0
+tokenizers==0.23.3
+safetensors==0.8.0
+huggingface-hub==1.33.0
+numpy==2.5.4
+scikit-learn==1.9.1
+scipy==1.18.1
+Pillow==13.0.0

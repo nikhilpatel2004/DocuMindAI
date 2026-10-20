@@ -1,0 +1,47 @@
+# Version control / editors
+.git
+.github
+.vscode
+.idea
+.devcontainer
+
+# Secrets and local environment files
+.env
+.env.example
+.env.production
+.env.production.*
+.env.local
+!.env.production.example
+
+# Python
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+backend/tests
+backend/data
+
+# Runtime state
+data
+uploads
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+
+# Node / build output
+node_modules
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Not needed in the runtime image
+README.md
+AUDIT_REPORT.md
+FINAL_CHECKLIST.md
+evaluation
+scripts
+test_write
+*.bak

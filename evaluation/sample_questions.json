@@ -1,0 +1,18 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "What is the capital of France?",
+      "document_ids": [],
+      "expected_behavior": "insufficient_context",
+      "hint": "No documents uploaded."
+    },
+    {
+      "id": "q2",
+      "question": "Who wrote the foreword of this document?",
+      "document_ids": [],
+      "expected_behavior": "insufficient_context",
+      "hint": "No documents uploaded."
+    }
+  ]
+}

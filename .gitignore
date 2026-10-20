@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.env
+.env.production
+.env.production.*
+!.env.production.example
+.venv
+venv/
+env/
+
+# Data & secrets
+data/
+*.db
+*.sqlite3
+/uploads/*  # uploaded user files
+
+# Node
+node_modules/
+/dist/
+/build/
+
+# LLM model files (can be large)
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Ops
+.hqdefault.jpg

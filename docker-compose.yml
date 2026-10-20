@@ -1,0 +1,68 @@
+name: documind
+
+# Run with:
+#   docker compose --env-file .env.production up -d --build
+services:
+  api:
+    build:
+      context: .
+      target: api
+    env_file:
+      - .env.production
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env.production}
+      KIE_API_KEY: ${KIE_API_KEY:?KIE_API_KEY must be set in .env.production}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS must be set in .env.production}
+      DEBUG: "false"
+      # Absolute paths keep all state inside the mounted volume.
+      DATABASE_URL: /app/data/documind.db
+      UPLOAD_DIR: /app/data/uploads
+      QDRANT_LOCAL_PATH: /app/data/qdrant
+      HF_HOME: /app/data/hf-cache
+    volumes:
+      - documind_data:/app/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  documind_data:
+    name: documind_data
