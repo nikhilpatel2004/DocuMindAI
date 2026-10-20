@@ -1,0 +1,438 @@
+"""Per-route implementations for the DocuMind AI API."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import BackgroundTasks, APIRouter, Depends, File, UploadFile, Request, HTTPException
+from fastapi.responses import JSONResponse
+
+from ...core.config import settings
+from ...core.exceptions import (
+    AuthenticationError, ConflictError, ForbiddenError, NotFoundError,
+    PayloadTooLargeError, UnsupportedMediaTypeError, ValidationError,
+    ProcessingError, InsufficientContextError, ModelUnavailableError,
+    ModelNotDownloadedError, TimeoutError
+)
+from ...core.security import (
+    create_access_token, decode_token, get_current_user_id,
+    verify_password, validate_email, validate_password_strength
+)
+from ...models.users import get_user_by_id, create_user, get_user_by_email
+from ...models.documents import (
+    create_document, delete_document, get_document, list_documents,
+    update_document_status
+)
+from ...models.conversations import (
+    create_conversation, list_conversations, get_conversation,
+    list_messages, add_message, touch_conversation
+)
+from ...services.pdf import validate_file, extract_text
+from ...services.llm import Citation, GenerationResult, SYSTEM_PROMPT
+from ...services.rag import Chunk, chunk_text, generate_embeddings
+from ...services.vector import upsert_chunks, search_chunks
+
+router = APIRouter(tags=["DocuMind AI"])
+
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+
+UPLOAD_DIR = Path(__file__).resolve().parents[2] / "data" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, set_true)
+
+def _save_upload(upload: UploadFile) -> Path:
+    """Save the uploaded file and return the ``Path`` to it."""
+    data = upload.file.read()
+    storage_name = f"{os.urandom(16).hex()}.pdf"
+    path = UPLOAD_DIR / storage_name
+    path.write_bytes(data)
+    return path
+
+
+def _extract_and_chunk(
+    pdf_path: Path, owner_id: int, document_id: str, chunk_size: int,
+    chunk_overlap: int
+) -> list[Chunk]:
+    """Extract text from PDF → chunks → generate embeddings → return ``Chunk`` objects."""
+    full_text, page_count = extract_text(pdf_path)
+    if not full_text.strip():
+        raise ProcessingError("The PDF contains no extractable text.")
+    chunks = chunk_text(full_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    # Annotate each chunk with document/owner/metadata
+    for i, chunk in enumerate(chunks):
+        chunk.document_id = document_id
+        chunk.owner_id = owner_id
+        chunk.page_number = (i % page_count) + 1  # simple round-robin
+        chunk.chunk_index = i
+        chunk.source_filename = pdf_path.name
+    # Generate embeddings for the chunks
+    chunk_texts = [chunk.text for chunk in chunks]
+    try:
+        embeddings = generate_embeddings(chunk_texts)
+        for i, chunk in enumerate(chunks):
+            chunk.embedding = embeddings[i]
+    except ImportError as e:
+        logger.warning("Sentence Transformers not available: %s", e)
+        raise ProcessingError("Embedding generation not available")
+    except Exception as e:
+        logger.warning("Failed to generate embeddings: %s", e)
+        raise ProcessingError("Embedding generation failed")
+    return chunks
+
+
+def _store_chunks_in_qdrant(chunks: list[Chunk]) -> None:
+    """Store chunks in Qdrant vector store."""
+    try:
+        upsert_chunks(chunks)
+        logger.info("Stored %d chunks in Qdrant collection %s", len(chunks), settings.qdrant_collection)
+    except ImportError as e:
+        logger.warning("Qdrant client not available: %s", e)
+        raise ProcessingError("Vector storage not available")
+    except Exception as e:
+        logger.warning("Failed to store chunks in Qdrant: %s", e)
+        raise ProcessingError("Vector storage failed")
+
+
+# -------------------------------------------------------------------------
+# Auth endpoints
+# -------------------------------------------------------------------------
+
+
+@router.post("/auth/register")
+async def register(
+    email: str,
+    password: str,
+):
+    """Register a new user."""
+    validate_email(email)
+    validate_password_strength(password)
+    try:
+        create_user(email, password)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    user = get_user_by_email(email)
+    access_token = create_access_token(user["id"], user["email"])
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user["id"], "email": user["email"]}}
+
+
+@router.post("/auth/login")
+async def login(
+    email: str,
+    password: str,
+):
+    """Log in and receive a JWT."""
+    user = get_user_by_email(email)
+    if user is None or not verify_password(password, user["password"]):
+        raise AuthenticationError("Invalid credentials")
+    access_token = create_access_token(user["id"], user["email"])
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user["id"], "email": user["email"]}}
+
+
+@router.get("/auth/me")
+async def me(current_user_id: int = Depends(get_current_user_id)):
+    """Return the authenticated user's ID."""
+    user = get_user_by_id(current_user_id)
+    if user is None:
+        raise NotFoundError("User not found")
+    return {"id": user["id"], "email": user["email"]}
+
+
+# -------------------------------------------------------------------------
+# Document endpoints
+# -------------------------------------------------------------------------
+
+
+@router.post("/documents")
+async def upload_document(
+    current_user_id: int = Depends(get_current_user_id),
+    file: UploadFile = File(...),
+):
+    """Upload a PDF document.
+
+    Only PDF files up to ``MAX_UPLOAD_MB`` (default 20) are accepted.
+    The backend validates the file, extracts text, chunks it, generates
+    local embeddings, and stores vectors in Qdrant scoped to the user.
+    """
+    # Validate file type
+    # FastAPI gives us the original filename — we must not trust it as a path.
+    original_name = file.filename or "unknown"
+    if not original_name.lower().endswith(".pdf"):
+        raise UnsupportedMediaTypeError("Only PDF files are accepted")
+
+    # Read and save
+    try:
+        upload_path = _save_upload(file)
+    except Exception as exc:  # noqa: broad-except
+        raise PayloadTooLargeError(
+            f"Could not save uploaded file: {exc}"
+        )
+
+    # Validate size and type
+    try:
+        validate_file(upload_path)
+    except ValueError as exc:
+        # Clean up the bad file
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Generate a server-controlled ID and store metadata
+    doc_id = f"doc_{uuid.uuid4().hex}"
+    try:
+        doc = create_document(
+            owner_id=current_user_id,
+            original_name=original_name,
+        )
+    except Exception:
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    # Process: extract, chunk, embed, store in Qdrant
+    try:
+        chunks = _extract_and_chunk(
+            pdf_path=upload_path,
+            owner_id=current_user_id,
+            document_id=doc["id"],
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+        _store_chunks_in_qdrant(chunks)
+
+        # Mark document as ready
+        update_document_status(
+            document_id=doc["id"],
+            status="ready",
+            page_count=len(chunks) // 10 + 1,  # rough estimate
+            chunk_count=len(chunks),
+        )
+    except ProcessingError as exc:
+        # Document stays in 'uploaded' / 'failed' state
+        try:
+            delete_document(document_id=doc["id"], owner_id=current_user_id)
+        except Exception:
+            pass
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ModelNotDownloadedError as exc:
+        try:
+            delete_document(document_id=doc["id"], owner_id=current_user_id)
+        except Exception:
+            pass
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ModelUnavailableError as exc:
+        try:
+            delete_document(document_id=doc["id"], owner_id=current_user_id)
+        except Exception:
+            pass
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: broad-except
+        try:
+            delete_document(document_id=doc["id"], owner_id=current_user_id)
+        except Exception:
+            pass
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.exception("Unexpected error during PDF processing")
+        raise HTTPException(status_code=500, detail="Document processing failed")
+
+    return {
+        "document_id": doc["id"],
+        "original_name": doc["original_name"],
+        "status": doc["status"],
+        "page_count": doc.get("page_count"),
+        "chunk_count": doc.get("chunk_count"),
+    }
+
+
+@router.get("/documents")
+async def list_my_documents(
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """List the authenticated user's documents."""
+    docs = list_documents(current_user_id)
+    return {"documents": docs}
+
+
+@router.get("/documents/{document_id}")
+async def get_my_document(
+    document_id: str,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Inspect a single document owned by the authenticated user."""
+    doc = get_document(document_id, current_user_id)
+    return doc
+
+
+@router.delete("/documents/{document_id}")
+async def delete_my_document(
+    document_id: str,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Delete a document and all its stored vectors."""
+    try:
+        deleted = delete_document(document_id, current_user_id)
+    except ForbiddenError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"detail": "Document deleted", "document_id": document_id}
+
+
+# -------------------------------------------------------------------------
+# Chat endpoint
+# -------------------------------------------------------------------------
+
+
+@router.post("/chat/ask")
+async def ask_question(
+    request: Request,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """Answer a user question using RAG over their uploaded documents."""
+    from fastapi.responses import JSONResponse
+    from ...core.exceptions import ValidationError, NotFoundError, InsufficientContextError
+    from ...core.security import get_current_user_id
+    from ...core.config import settings
+    from ...services.llm import SYSTEM_PROMPT, Citation, GenerationResult
+    from ...services.rag import Chunk, chunk_text
+    from ...services.vector import search_chunks
+
+    body = await request.json()
+    question: str = body.get("question", "")
+    document_ids = body.get("document_ids", None)
+
+    if not question or not question.strip():
+        raise ValidationError("Question is required")
+
+    # Resolve which documents the user may search
+    from ...models.documents import list_documents
+    if document_ids:
+        allowed = []
+        for did in document_ids:
+            try:
+                from ...models.documents import get_document as _gd
+                _gd(did, current_user_id)
+                allowed.append(did)
+            except Exception:
+                continue
+    else:
+        docs = list_documents(current_user_id)
+        allowed = [d["id"] for d in docs if d["status"] == "ready"]
+
+    if not allowed:
+        raise NotFoundError("No accessible documents found")
+
+    # --- Retrieve context ---
+    try:
+        # Generate query embedding
+        query_embeddings = generate_embeddings([question])
+        query_embedding = query_embeddings[0]
+    except ImportError as e:
+        logger.warning("Sentence Transformers not available: %s", e)
+        raise ProcessingError("Embedding generation not available")
+    except Exception as e:
+        logger.warning("Failed to generate query embedding: %s", e)
+        raise ProcessingError("Query embedding generation failed")
+
+    # Search for relevant chunks
+    try:
+        results = search_chunks(
+            query_embedding=query_embedding,
+            owner_id=current_user_id,
+            document_ids=allowed,
+            limit=settings.top_k
+        )
+    except ImportError as e:
+        logger.warning("Qdrant client not available: %s", e)
+        raise ProcessingError("Vector storage not available")
+    except Exception as e:
+        logger.warning("Failed to search Qdrant: %s", e)
+        raise ProcessingError("Vector search failed")
+
+    if not results:
+        raise InsufficientContextError(
+            "No relevant context found in the uploaded documents. "
+            "Try uploading a document that contains the answer to your question."
+        )
+
+    # Build context and citations
+    context_parts = []
+    citations = []
+    for chunk, score in results:
+        context_parts.append(chunk.text)
+        citations.append(Citation(
+            source_filename=chunk.source_filename,
+            page_number=chunk.page_number,
+            chunk_id=chunk.chunk_id
+        ))
+    context = "\n\n---\n\n".join(context_parts)
+
+    # Generate answer using Ollama
+    try:
+        # Import here to avoid circular imports
+        from ...services.llm import generate_answer
+        generation_result = generate_answer(
+            question=question,
+            context=context,
+            citations=citations
+        )
+        answer = generation_result.answer
+        final_citations = generation_result.citations
+        fallback = generation_result.fallback
+        insufficient_context = generation_result.insufficient_context
+    except ImportError as e:
+        logger.warning("LLM service not available: %s", e)
+        raise ProcessingError("LLM generation not available")
+    except Exception as e:
+        logger.warning("Failed to generate answer: %s", e)
+        raise ProcessingError("Answer generation failed")
+
+    # Build response
+    response = {
+        "answer": answer,
+        "citations": [
+            {
+                "source_filename": c.source_filename,
+                "page_number": c.page_number,
+                "chunk_id": c.chunk_id
+            }
+            for c in final_citations
+        ],
+        "conversation_id": None  # We'll handle conversation persistence later
+    }
+
+    if fallback or insufficient_context:
+        response["fallback"] = True
+        if insufficient_context:
+            response["insufficient_context"] = True
+
+    return response
