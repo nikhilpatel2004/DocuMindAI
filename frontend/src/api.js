@@ -9,6 +9,15 @@ export class ApiError extends Error {
 const TOKEN_KEY = "documind_token";
 const USER_KEY = "documind_user";
 
+// Set VITE_API_URL when the API is hosted on a different origin than the app
+// (for example a Hugging Face Space). Falls back to same-origin /api paths.
+const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
+
+function withBase(path) {
+  if (!API_BASE || /^https?:\/\//i.test(path)) return path;
+  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 export function getToken() {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -64,7 +73,7 @@ export async function apiFetch(path, options = {}) {
 
   let res;
   try {
-    res = await fetch(path, options);
+    res = await fetch(withBase(path), options);
   } catch {
     throw new ApiError("Network error — make sure the backend is running.", 0);
   }
@@ -93,7 +102,7 @@ export async function apiFetch(path, options = {}) {
 export function uploadFile(path, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", path);
+    xhr.open("POST", withBase(path));
 
     const token = getToken();
     if (token) {
