@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+
+# API-only image for hosts that build a single Dockerfile stage (e.g. Render).
+# Local development keeps using the combined Dockerfile via docker-compose.
+
+FROM python:3.14-slim AS api
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/app/data/hf-cache
+
+WORKDIR /app/backend
+
+RUN groupadd --system --gid 1000 appuser \
+    && useradd --system --uid 1000 --gid appuser --create-home appuser
+
+COPY backend/requirements.lock.txt ./requirements.lock.txt
+
+# CPU-only PyTorch keeps the image small (no CUDA libraries).
+RUN python -m pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.14.1" \
+    && python -m pip install --no-cache-dir --only-binary=:all: \
+        -r requirements.lock.txt
+
+COPY backend/ ./
+COPY docker/api-entrypoint.sh /usr/local/bin/api-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/api-entrypoint.sh \
+    && mkdir -p /app/data/uploads /app/data/qdrant /app/data/hf-cache \
+    && chown -R appuser:appuser /app
+
+# Runs as root only long enough to claim the mounted data volume, then drops
+# to appuser. Render-style persistent disks mount root-owned.
+USER root
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-8000}/healthz', timeout=4)"
+
+ENTRYPOINT ["/usr/local/bin/api-entrypoint.sh"]
